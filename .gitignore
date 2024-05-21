@@ -1,8 +1,9 @@
-*~
 *.bak
-bin/
+*.log
+*~
 .git/
 .github/
-TODO*
 .vscode/
+TODO*
 XXX*
+bin/
