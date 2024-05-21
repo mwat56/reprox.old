@@ -1,0 +1,78 @@
+#!/bin/bash
+set -u -x
+
+# github username:
+declare -r GITUSER='mwat56'
+
+#TODO: check arguments
+if [ 0 -eq $# ] ; then
+	echo "
+	missing arguments:
+	$0 <ProjectName> [GitRepository]
+" 1>&2
+	exit 1
+fi
+
+git-remote-url-reachable() {
+	git ls-remote --exit-code -h "$1" >/dev/null 2>&1
+}
+
+declare -r NEWPROJECT=${1}
+declare -r REMOTEGIT="https://github.com/${GITUSER}/${NEWPROJECT}.git"
+
+# create directories for the new Go project:
+mkdir -p ${NEWPROJECT}/{cmd,internal}
+
+# move updated skeleton files to project directory:
+cd ../_new
+
+for f in *.go {README,TODO}.md go.mod ; do
+	sed "s/XXX/${NEWPROJECT}/g" $f > ../${NEWPROJECT}/$f
+done
+
+cp .gitignore ../${NEWPROJECT}/
+ln LICENSE ../${NEWPROJECT}/
+ln CODE* ../${NEWPROJECT}/
+
+cd ../${NEWPROJECT}
+mv -v APPNAME.go ${NEWPROJECT}.go
+
+go mod init github.com/${GITUSER}/${NEWPROJECT} #2>/dev/null
+go get -u ./... ; go mod tidy
+
+# initialise Git repository:
+(
+	git config --global init.defaultBranch main
+	git init
+
+	## Change git `master` branch to `main`
+	git branch -m master main
+	git push -u origin main
+	git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+#
+#echo "
+#See the web-page shown above and change the default branch on github to 'main'"
+#read -p "press <RETURN> when done." REPLY
+#
+	git branch -d master
+	git push origin --delete master
+
+	# check local files into local repository:
+	git add . # * .gitignore
+	git commit -m "+ initial checkin"
+	git tag v0.0.0
+
+	if git-remote-url-reachable "${REMOTEGIT}"; then
+		git remote add origin "${REMOTEGIT}"
+
+		# copy local data to remote repository:
+		git push -u origin main --tags
+
+		git remote -v
+	fi
+
+	git status; git branch; git tag
+) 2>/dev/null
+echo
+
+#_EoF_

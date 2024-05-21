@@ -1,0 +1,12 @@
+#!/bin/bash
+# $Id$
+#
+#	Delete a git tag locally and remote
+#------------------------------------------------------------------------------
+#set -x
+TAG="${1}"
+
+git push --delete origin "${TAG}"
+git tag -d "${TAG}"
+
+#_EoF_
