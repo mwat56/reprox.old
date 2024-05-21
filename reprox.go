@@ -1,206 +1,159 @@
 /*
-   Copyright © 2024  M.Watermann, 10247 Berlin, Germany
-               All rights reserved
-           EMail : <support@mwat.de>
-*/
+Copyright © 2024  M.Watermann, 10247 Berlin, Germany
 
-package main
+	    All rights reserved
+	EMail : <support@mwat.de>
+*/
+package reprox
 
 //lint:file-ignore ST1017 - I prefer Yoda conditions
 
 import (
-	"context"
-	"crypto/tls"
 	"fmt"
-	"log"
-	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
-	"os"
-	"os/signal"
-	"path/filepath"
-	"runtime"
-	"syscall"
-	"time"
 
-	"github.com/NYTimes/gziphandler"
 	"github.com/mwat56/apachelogger"
-	"github.com/mwat56/errorhandler"
-	"github.com/mwat56/reprox"
 )
 
-// `exit()` Log `aMessage` and terminate the program.
-func exit(aMessage string) {
-	apachelogger.Err("APPNAME/main", aMessage)
-	runtime.Gosched() // let the logger write
-	log.Fatalln(aMessage)
-} // exit()
+type (
+	//
+	tDestination struct {
+		destHost  string
+		destProxy *httputil.ReverseProxy
+	}
 
-// `redirHTTP()` Send HTTP clients to HTTPS server.
+	// list of proxied servers:
+	tBackendServers = map[string]tDestination
+
+	TProxyHandler struct {
+		backendServers tBackendServers
+	}
+)
+
+// `createReverseProxy()` creates a new reverse proxy that routes
+// requests to the specified target.
+// The target is a URL string that represents the backend server to
+// which the requests will be forwarded.
 //
-// see: https://gist.github.com/d-schmidt/587ceec34ce1334a5e60
-func redirHTTP(aWriter http.ResponseWriter, aRequest *http.Request) {
-	// Copy the original URL and replace the scheme:
-	targetURL := url.URL{
-		Scheme:     `https`,
-		Opaque:     aRequest.URL.Opaque,
-		User:       aRequest.URL.User,
-		Host:       aRequest.URL.Host,
-		Path:       aRequest.URL.Path,
-		RawPath:    aRequest.URL.RawPath,
-		ForceQuery: aRequest.URL.ForceQuery,
-		RawQuery:   aRequest.URL.RawQuery,
-		Fragment:   aRequest.URL.Fragment,
-	}
-	target := targetURL.String()
-
-	apachelogger.Err(`APPNAME/main`, `redirecting to: `+target)
-	http.Redirect(aWriter, aRequest, target, http.StatusTemporaryRedirect)
-} // redirHTTP()
-)
-
-// `setupSignals()` configures the capture of the interrupts `SIGINT`
-// `and `SIGTERM` to terminate the program gracefully.
-func setupSignals(aServer *http.Server) {
-	// handle `CTRL-C` and `kill(15)`.
-	c := make(chan os.Signal, 2)
-	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		for signal := range c {
-			msg := fmt.Sprintf("%s captured '%v', stopping program and exiting ...", filepath.Base(os.Args[0]), signal)
-			apachelogger.Err(`Nele/catchSignals`, msg)
-			log.Println(msg)
-			break
-		} // for
-
-		ctx, cancel := context.WithCancel(context.Background())
-		aServer.BaseContext = func(net.Listener) context.Context {
-			return ctx
-		}
-		aServer.RegisterOnShutdown(cancel)
-
-		ctxTimeout, cancelTimeout := context.WithTimeout(
-			context.Background(), time.Second*10)
-		defer cancelTimeout()
-		if err := aServer.Shutdown(ctxTimeout); nil != err {
-			exit(fmt.Sprintf("%s: %v", filepath.Base(os.Args[0]), err))
-		}
-	}()
-} // setupSignals()
-
-
-// Actually run the program …
-func main() {
-	var (
-		err     error
-		handler http.Handler
-		ph      *nele.TPageHandler
-	)
-	Me, _ := filepath.Abs(os.Args[0])
-
-	// Read INI files and commandline options
-	APPNAME.InitConfig()
-
-	if ph, err = nele.NewPageHandler(); nil != err {
-		nele.ShowHelp()
-		exit(fmt.Sprintf("%s: %v", Me, err))
+// The function returns a pointer to an `httputil.ReverseProxy` instance.
+// If an error occurs during the parsing of the target URL, the function
+// logs the error and exits the program.
+//
+// Parameters:
+//
+//	`aTarget` (tDestination): The URL struct representing the backend
+//	server to which the requests will be forwarded.
+//
+// Return:
+// *httputil.ReverseProxy: A pointer to an `httputil.ReverseProxy` instance.
+func createReverseProxy(aDestination tDestination) (*httputil.ReverseProxy, error) {
+	if nil != aDestination.destProxy {
+		// there's already a running reverse proxy
+		return aDestination.destProxy, nil
 	}
 
-	// Setup the errorpage handler:
-	handler = errorhandler.Wrap(ph, ph)
-
-	// Inspect `gzip` commandline argument and setup the Gzip handler:
-	if APPNAME.AppArgs.GZip {
-		handler = gziphandler.GzipHandler(handler)
+	targetURL, err := url.ParseRequestURI(aDestination.destHost)
+	if nil != err {
+		msg := fmt.Sprintf("Internal Server Error [%s]", aDestination.destHost)
+		apachelogger.Err("ReProx/createReverseProxy", msg)
+		return nil, err
 	}
 
-	// Inspect logging commandline arguments and setup the `ApacheLogger`:
-	handler = apachelogger.Wrap(handler, nele.AppArgs.AccessLog, nele.AppArgs.ErrorLog)
+	return httputil.NewSingleHostReverseProxy(targetURL), nil
+} // createReverseProxy()
 
-	ctxTimeout, cancelTimeout := context.WithTimeout(
-		context.Background(), time.Second*10)
-	defer cancelTimeout()
+// `initBackendList()` creates a new map of backend servers.
+//
+// The function returns a pointer to a map of backend servers.
+// Each entry in the map contains a hostname and a proxy instance.
+//
+// TODO: The function reads the backend server configuration from a
+// `configFile` and populates the `backendServers` map accordingly.
+//
+// If the `configFile` is empty or does not exist, the function
+// populates the `backendServers` map with default values.
+//
+// The function returns a pointer to the `backendServers` map.
+//
+// Parameters:
+//
+//	`aConfigFile` string - The path to the configuration file containing
+//
+// the backend server URLs.
+//
+// Returns:
+//
+//	*tBackendServers - A pointer to a map of backend servers.
+func initBackendList( /*aConfigFile string*/ ) *tBackendServers {
 
-	// We need a `server` reference to use it in `setupSignals()`
-	// and to set some reasonable timeouts:
-	server := &http.Server{
-		// The TCP address for the server to listen on:
-		Addr: APPNAME.AppArgs.Addr,
-		// Return the base context for incoming requests on this server:
-		BaseContext: func(net.Listener) context.Context {
-			return ctxTimeout
-		},
-		// Request handler to invoke:
-		Handler: handler,
-		// Set timeouts so that a slow or malicious client
-		// doesn't hold resources forever
-		//
-		// The maximum amount of time to wait for the next request;
-		// if IdleTimeout is zero, the value of ReadTimeout is used:
-		IdleTimeout: 0,
-		// The amount of time allowed to read request headers:
-		ReadHeaderTimeout: 10 * time.Second,
-		// The maximum duration for reading the entire request,
-		// including the body:
-		ReadTimeout: 10 * time.Second,
-		// The maximum duration before timing out writes of the response:
-		// WriteTimeout: 10 * time.Second,
-		WriteTimeout: -1, // see whether this eliminates "i/o timeout HTTP/1.0"
+	//TODO: read from config file
+
+	return &tBackendServers{
+		"bla.mwat.de":      tDestination{"http://192.168.192.236:8181", nil},
+		"bla.mwat.de:80":   tDestination{"http://192.168.192.236:8181", nil},
+		"bla.mwat.de:443":  tDestination{"http://192.168.192.236:8181", nil},
+		"read.mwat.de":     tDestination{"http://192.168.192.236:8383", nil},
+		"read.mwat.de:80":  tDestination{"http://192.168.192.236:8383", nil},
+		"read.mwat.de:443": tDestination{"http://192.168.192.236:8383", nil},
 	}
-	if 0 < len(APPMAME.AppArgs.ErrorLog) {
-		apachelogger.SetErrLog(server)
-	}
-	setupSignals(server)
+} // initBackendList()
 
-	if 0 < len(APPNAME.AppArgs.CertKey) && (0 < len(APPNAME.AppArgs.CertPem)) {
-		// start the HTTP to HTTPS redirector:
-		go http.ListenAndServe(APPNAME.AppArgs.Addr, http.HandlerFunc(redirHTTP))
-
-		// see:
-		// https://ssl-config.mozilla.org/#server=golang&version=1.14.1&config=old&guideline=5.4
-		server.TLSConfig = &tls.Config{
-			MinVersion:               tls.VersionTLS10,
-			PreferServerCipherSuites: true,
-			CipherSuites: []uint16{
-				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-				tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
-				tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
-				tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA,
-				tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_RSA_WITH_AES_128_CBC_SHA256,
-				tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-				tls.TLS_RSA_WITH_AES_128_CBC_SHA,
-				tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,
-				tls.TLS_RSA_WITH_RC4_128_SHA,
-				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, // #nosec G402
-			},
-		} // #nosec G402
-		// server.TLSNextProto = make(map[string]func(*http.Server, *tls.Conn, http.Handler))
-
-		s := fmt.Sprintf("%s listening HTTPS at: %s", Me, APPNAME.AppArgs.Addr)
-		log.Println(s)
-		apachelogger.Log("APPNAME/main", s)
-		exit(fmt.Sprintf("%s: %v", Me,
-			server.ListenAndServeTLS(APPNAME.AppArgs.CertPem, APPNAME.AppArgs.CertKey)))
+// `ServeHTTP()` is the main entry point for the reverse proxy server.
+// It handles incoming HTTP requests and forwards them to the
+// appropriate backend server.
+//
+// Parameters:
+// - `aWriter`: The `ResponseWriter` to write HTTP response headers and body.
+// - `aRequest`: The Request struct containing all the details of the
+// incoming HTTP request.
+func (ph TProxyHandler) ServeHTTP(aWriter http.ResponseWriter, aRequest *http.Request) {
+	// Check if a backend server is available for the requested host.
+	target, ok := ph.backendServers[aRequest.Host]
+	if !ok {
+		msg := fmt.Sprintf("Backend server %q not found", aRequest.Host)
+		apachelogger.Err("ReProx/ServeHTTP", msg)
+		// If no backend server is found, send a 404 Not Found HTTP response.
+		http.Error(aWriter, msg, http.StatusNotFound)
 		return
 	}
 
-	s := fmt.Sprintf("%s listening HTTP at: %s", Me, APPNAME.AppArgs.Addr)
-	log.Println(s)
-	apachelogger.Log("APPNAME/main", s)
-	exit(fmt.Sprintf("%s: %v", Me, server.ListenAndServe()))
-} // main()
+	// Create a new reverse proxy for the target backend server.
+	proxy, err := createReverseProxy(target)
+	if nil != err {
+		// If an error occurs while creating the reverse proxy,
+		// send a 500 Internal Server Error HTTP response.
+		msg := "Internal Server Error"
+		// apachelogger.Err("ReProx/ServeHTTP", msg)
+		http.Error(aWriter, msg, http.StatusInternalServerError)
+		return // exit(err.Error())
+	}
+
+	target.destProxy = proxy
+	ph.backendServers[aRequest.Host] = target
+
+	// Serve the incoming HTTP request using the reverse proxy.
+	proxy.ServeHTTP(aWriter, aRequest)
+} // ServeHTTP()
+
+// `NewProxyHandler()` creates a new instance of TProxyHandler.
+// It initializes the backendServers map with the list of available servers.
+//
+// Parameters:
+// - `aConfigFile` (string): The path to the configuration file containing
+// the backend server URLs.
+// If the file is empty or does not exist, the function populates the
+// backendServers map with default values.
+//
+// Returns:
+// - *TProxyHandler: A pointer to a new instance of TProxyHandler.
+func NewProxyHandler( /*aConfigFile string*/ ) *TProxyHandler {
+	result := &TProxyHandler{
+		backendServers: *initBackendList( /*aConfigFile string*/ ),
+	}
+
+	return result
+} // NewProxyHandler()
 
 /* _EoF_ */
